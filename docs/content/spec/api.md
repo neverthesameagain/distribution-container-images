@@ -88,9 +88,26 @@ processes A and B. Build process A completes uploading the layer before B.
 When process B attempts to upload the layer, the registry indicates that its
 not necessary because the layer is already known.
 
-If process A and B upload the same layer at the same time, both operations
-will proceed and the first to complete will be stored in the registry (Note:
-we may modify this to prevent dogpile with some locking mechanism).
+If process A and B upload the same layer at the same time, the registry uses
+digest-scoped locking to serialize the commit operations. Both uploads may proceed
+to the commit phase, but only one will perform the actual storage write operation.
+The second commit will detect that the blob already exists and skip the redundant
+write, completing successfully without duplicating data.
+
+#### Idempotent Upload Requests
+
+Clients may safely retry upload initiation requests using two mechanisms:
+
+1. Digest Check: When initiating an upload with the `digest` query parameter,
+   the registry checks if a blob with that digest already exists. If so, the
+   registry returns success without creating a new upload session.
+
+2. Idempotency Keys: Clients can include an `X-Idempotency-Key` header with
+   a unique client-generated key. If an upload session was previously created with
+   the same key (within the retention period), the registry returns the existing
+   session's location instead of creating a duplicate session. This is particularly
+   useful when retrying requests where the initial response was lost due to network
+   issues.
 
 ### Changes
 
@@ -109,6 +126,15 @@ reference and shouldn't be used outside the specification other than to
 identify a set of modifications.
 
 <dl>
+  <dt>m</dt>
+  <dd>
+    <ul>
+      <li>Added idempotent blob upload support via digest check and idempotency keys.</li>
+      <li>Added X-Idempotency-Key header for safe upload session retries.</li>
+      <li>Added digest-scoped locking documentation for concurrent upload handling.</li>
+    </ul>
+  </dd>
+
   <dt>l</dt>
   <dd>
     <ul>
@@ -3142,19 +3168,24 @@ Host: <registry host>
 Authorization: <scheme> <token>
 Content-Length: <length of blob>
 Content-Type: application/octet-stream
+X-Idempotency-Key: <idempotency-key>
 
 <binary data>
 ```
 Upload a blob identified by the `digest` parameter in single request. This upload will not be resumable unless a recoverable error is returned.
+
+When the `digest` parameter is provided, the registry first checks if a blob with that digest already exists. If so, it returns `201 Created` with the blob's location without creating an upload session or storing the request body. This makes monolithic uploads naturally idempotent - retrying the same request with the same digest and content will succeed without creating duplicate data.
+
 The following parameters should be specified on the request:
 
 |Name|Kind|Description|
 |----|----|-----------|
 |`Host`|header|Standard HTTP Host Header. Should be set to the registry host.|
 |`Authorization`|header|An RFC7235 compliant authorization header.|
-|`Content-Length`|header||
+|`Content-Length`|header|Length of the blob content.|
+|`X-Idempotency-Key`|header|Optional. A client-generated unique key for this upload request. Enables safe retries when the client is uncertain if the initial request succeeded.|
 |`name`|path|Name of the target repository.|
-|`digest`|query|Digest of uploaded blob. If present, the upload will be completed, in a single request, with contents of the request body as the resulting blob.|
+|`digest`|query|Digest of uploaded blob. If present, the upload will be completed, in a single request, with contents of the request body as the resulting blob. The registry may check if a blob with this digest already exists before processing the upload.|
 
 ###### On Success: Created
 
@@ -3353,6 +3384,7 @@ POST /v2/<name>/blobs/uploads/
 Host: <registry host>
 Authorization: <scheme> <token>
 Content-Length: 0
+X-Idempotency-Key: <idempotency-key>
 ```
 Initiate a resumable blob upload with an empty request body.
 The following parameters should be specified on the request:
@@ -3362,7 +3394,9 @@ The following parameters should be specified on the request:
 |`Host`|header|Standard HTTP Host Header. Should be set to the registry host.|
 |`Authorization`|header|An RFC7235 compliant authorization header.|
 |`Content-Length`|header|The `Content-Length` header must be zero and the body must be empty.|
+|`X-Idempotency-Key`|header|Optional. A client-generated unique key for this upload request. If provided and a session with this key already exists, the registry returns a `202 Accepted` response with the existing session's `Location` header instead of creating a new session. This enables safe retries when the client is uncertain if the initial request succeeded. Keys are retained for approximately 30 minutes.|
 |`name`|path|Name of the target repository.|
+|`digest`|query|Optional. If provided without request body, the registry checks if a blob with this digest already exists. If so, returns `200 OK` instead of creating a new upload session. This enables idempotent uploads where the digest is known upfront.|
 
 ###### On Success: Accepted
 

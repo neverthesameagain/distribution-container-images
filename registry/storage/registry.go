@@ -28,6 +28,10 @@ type registry struct {
 	blobDescriptorServiceFactory distribution.BlobDescriptorServiceFactory
 	driver                       storagedriver.StorageDriver
 
+	// Concurrency control for blob uploads
+	digestLocker        DigestLocker
+	sessionDeduplicator *SessionDeduplicator
+
 	// Validation
 	manifestURLs         manifestURLs
 	validateImageIndexes validateImageIndexes
@@ -131,6 +135,24 @@ func BlobDescriptorServiceFactory(factory distribution.BlobDescriptorServiceFact
 	}
 }
 
+// DisableDigestLocking is a functional option for NewRegistry. It disables
+// digest-scoped locking during blob commits. This may be useful in environments
+// where the locking overhead is undesirable and the operator accepts the
+// possibility of redundant Move operations during concurrent commits.
+// Note: This does NOT affect correctness, only efficiency.
+func DisableDigestLocking(registry *registry) error {
+	registry.digestLocker = NoopDigestLocker{}
+	return nil
+}
+
+// DisableSessionDeduplication is a functional option for NewRegistry. It disables
+// session deduplication via idempotency keys. Clients will always receive new
+// session IDs even when providing the same idempotency key.
+func DisableSessionDeduplication(registry *registry) error {
+	registry.sessionDeduplicator = nil
+	return nil
+}
+
 // BlobDescriptorCacheProvider returns a functional option for
 // NewRegistry. It creates a cached blob statter for use by the
 // registry.
@@ -176,6 +198,9 @@ func NewRegistry(ctx context.Context, driver storagedriver.StorageDriver, option
 		statter:                statter,
 		resumableDigestEnabled: true,
 		driver:                 driver,
+		// Initialize concurrency control components
+		digestLocker:        NewInMemoryDigestLocker(),
+		sessionDeduplicator: NewSessionDeduplicator(0), // use default TTL
 	}
 
 	for _, option := range options {

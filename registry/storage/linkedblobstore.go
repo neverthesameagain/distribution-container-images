@@ -124,6 +124,51 @@ func WithMountFrom(ref reference.Canonical) distribution.BlobCreateOption {
 	})
 }
 
+// WithDigestCheck returns a BlobCreateOption that enables idempotent upload
+// behavior. When provided, the storage implementation will check if a blob
+// with the given digest already exists in the repository before creating a
+// new upload session. If the blob exists, ErrBlobAlreadyExists is returned,
+// allowing the client to skip the redundant upload.
+//
+// This option is particularly useful for:
+//   - Monolithic uploads where the digest is known upfront
+//   - Preventing duplicate upload sessions under concurrent requests
+//   - Client retry scenarios where the blob may have been uploaded successfully
+func WithDigestCheck(dgst digest.Digest) distribution.BlobCreateOption {
+	return optionFunc(func(v interface{}) error {
+		opts, ok := v.(*distribution.CreateOptions)
+		if !ok {
+			return fmt.Errorf("unexpected options type: %T", v)
+		}
+
+		opts.CheckExistence.Digest = dgst
+
+		return nil
+	})
+}
+
+// WithIdempotencyKey returns a BlobCreateOption that provides a client-generated
+// idempotency key for the upload session. If a session with the same key already
+// exists and hasn't expired, the existing session ID is returned via
+// ErrBlobUploadResumed, allowing the client to resume rather than create a
+// duplicate session.
+//
+// This is particularly useful for:
+//   - Client retries where the initial POST succeeded but response was lost
+//   - Ensuring exactly-once session creation semantics
+func WithIdempotencyKey(key string) distribution.BlobCreateOption {
+	return optionFunc(func(v interface{}) error {
+		opts, ok := v.(*distribution.CreateOptions)
+		if !ok {
+			return fmt.Errorf("unexpected options type: %T", v)
+		}
+
+		opts.IdempotencyKey = key
+
+		return nil
+	})
+}
+
 // Create begins a blob write session, returning a handle.
 func (lbs *linkedBlobStore) Create(ctx context.Context, options ...distribution.BlobCreateOption) (distribution.BlobWriter, error) {
 	dcontext.GetLogger(ctx).Debug("(*linkedBlobStore).Create")
@@ -142,6 +187,66 @@ func (lbs *linkedBlobStore) Create(ctx context.Context, options ...distribution.
 		if err == nil {
 			// Mount successful, no need to initiate an upload session
 			return nil, distribution.ErrBlobMounted{From: opts.Mount.From, Descriptor: desc}
+		}
+	}
+
+	// Check for existing session by idempotency key first.
+	// This enables clients to safely retry upload initiation without creating
+	// duplicate sessions.
+	if opts.IdempotencyKey != "" && lbs.registry != nil && lbs.registry.sessionDeduplicator != nil {
+		existingSessionID, found := lbs.registry.sessionDeduplicator.LookupByIdempotencyKey(opts.IdempotencyKey)
+		if found {
+			dcontext.GetLoggerWithFields(ctx, map[interface{}]interface{}{
+				"idempotency_key": opts.IdempotencyKey,
+				"session_id":      existingSessionID,
+			}).Debug("found existing session for idempotency key")
+			MetricsSessionDeduplicatedByIdempotencyKey()
+			return nil, distribution.ErrBlobUploadResumed{SessionID: existingSessionID}
+		}
+	}
+
+	// Check if blob already exists when digest is provided upfront.
+	// This enables idempotent upload behavior by preventing duplicate upload
+	// sessions for blobs that are already present in the repository. This is
+	// particularly important for:
+	// - Concurrent uploads of the same blob from multiple clients
+	// - Client retries where the initial upload may have succeeded
+	// - Monolithic uploads where the digest is known before starting
+	if opts.CheckExistence.Digest != "" {
+		desc, err := lbs.Stat(ctx, opts.CheckExistence.Digest)
+		if err == nil {
+			// Blob already exists in this repository, no need for upload
+			dcontext.GetLoggerWithFields(ctx, map[interface{}]interface{}{
+				"digest": opts.CheckExistence.Digest,
+			}).Debug("blob already exists, skipping upload session creation")
+			MetricsSessionDeduplicatedByDigest()
+			return nil, distribution.ErrBlobAlreadyExists{
+				Digest:     opts.CheckExistence.Digest,
+				Descriptor: desc,
+			}
+		}
+		// If error is ErrBlobUnknown, blob doesn't exist - continue with upload
+		// For other errors, we continue anyway as the upload might still succeed
+		if err != distribution.ErrBlobUnknown {
+			dcontext.GetLoggerWithFields(ctx, map[interface{}]interface{}{
+				"digest": opts.CheckExistence.Digest,
+				"error":  err,
+			}).Debug("error checking blob existence, continuing with upload")
+		}
+
+		// Check if there's already an active upload session for this digest.
+		// This prevents duplicate sessions when a client retries while the
+		// first upload is still in progress (mid-upload retry scenario).
+		if lbs.registry != nil && lbs.registry.sessionDeduplicator != nil {
+			existingSessionID, found := lbs.registry.sessionDeduplicator.LookupByDigest(opts.CheckExistence.Digest)
+			if found {
+				dcontext.GetLoggerWithFields(ctx, map[interface{}]interface{}{
+					"digest":     opts.CheckExistence.Digest,
+					"session_id": existingSessionID,
+				}).Debug("found existing upload session for digest, resuming")
+				MetricsSessionDeduplicatedByDigest()
+				return nil, distribution.ErrBlobUploadResumed{SessionID: existingSessionID}
+			}
 		}
 	}
 
@@ -169,7 +274,19 @@ func (lbs *linkedBlobStore) Create(ctx context.Context, options ...distribution.
 		return nil, err
 	}
 
-	return lbs.newBlobUpload(ctx, uuid, path, startedAt, false)
+	// Register the session for idempotency tracking
+	if lbs.registry != nil && lbs.registry.sessionDeduplicator != nil {
+		lbs.registry.sessionDeduplicator.RegisterSession(
+			uuid,
+			opts.IdempotencyKey,
+			opts.CheckExistence.Digest,
+		)
+	}
+
+	// Record metrics for session creation
+	MetricsSessionCreated()
+
+	return lbs.newBlobUpload(ctx, uuid, path, startedAt, false, opts.CheckExistence.Digest, opts.IdempotencyKey)
 }
 
 func (lbs *linkedBlobStore) Resume(ctx context.Context, id string) (distribution.BlobWriter, error) {
@@ -206,7 +323,9 @@ func (lbs *linkedBlobStore) Resume(ctx context.Context, id string) (distribution
 		return nil, err
 	}
 
-	return lbs.newBlobUpload(ctx, id, path, startedAt, true)
+	// For resumed uploads, we don't have the original digest/idempotency key,
+	// but they're already tracked from the original Create call.
+	return lbs.newBlobUpload(ctx, id, path, startedAt, true, "", "")
 }
 
 func (lbs *linkedBlobStore) Delete(ctx context.Context, dgst digest.Digest) error {
@@ -301,7 +420,7 @@ func (lbs *linkedBlobStore) mount(ctx context.Context, sourceRepo reference.Name
 }
 
 // newBlobUpload allocates a new upload controller with the given state.
-func (lbs *linkedBlobStore) newBlobUpload(ctx context.Context, uuid, path string, startedAt time.Time, append bool) (distribution.BlobWriter, error) {
+func (lbs *linkedBlobStore) newBlobUpload(ctx context.Context, uuid, path string, startedAt time.Time, append bool, expectedDigest digest.Digest, idempotencyKey string) (distribution.BlobWriter, error) {
 	fw, err := lbs.driver.Writer(ctx, path, append)
 	if err != nil {
 		return nil, err
@@ -317,6 +436,8 @@ func (lbs *linkedBlobStore) newBlobUpload(ctx context.Context, uuid, path string
 		driver:                 lbs.driver,
 		path:                   path,
 		resumableDigestEnabled: lbs.resumableDigestEnabled,
+		expectedDigest:         expectedDigest,
+		idempotencyKey:         idempotencyKey,
 	}
 
 	return bw, nil

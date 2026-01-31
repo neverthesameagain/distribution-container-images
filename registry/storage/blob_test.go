@@ -610,3 +610,200 @@ func addBlob(ctx context.Context, bs distribution.BlobIngester, desc v1.Descript
 
 	return wr.Commit(ctx, desc)
 }
+
+// TestIdempotentBlobUploadWithDigestCheck verifies that when a digest is
+// provided upfront via WithDigestCheck option, the storage layer returns
+// ErrBlobAlreadyExists if the blob is already present, preventing duplicate
+// upload sessions.
+func TestIdempotentBlobUploadWithDigestCheck(t *testing.T) {
+	ctx := context.Background()
+	imageName, _ := reference.WithName("foo/bar")
+	driver := inmemory.New()
+	registry, err := NewRegistry(ctx, driver, BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)), EnableDelete, EnableRedirect)
+	if err != nil {
+		t.Fatalf("error creating registry: %v", err)
+	}
+	repository, err := registry.Repository(ctx, imageName)
+	if err != nil {
+		t.Fatalf("unexpected error getting repo: %v", err)
+	}
+	bs := repository.Blobs(ctx)
+
+	// Create test blob content
+	blobContent := []byte("test blob content for idempotency check")
+	dgst := digest.FromBytes(blobContent)
+
+	// First upload should succeed normally
+	wr, err := bs.Create(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error starting first upload: %v", err)
+	}
+	if _, err := wr.Write(blobContent); err != nil {
+		t.Fatalf("unexpected error writing blob: %v", err)
+	}
+	desc, err := wr.Commit(ctx, v1.Descriptor{Digest: dgst})
+	if err != nil {
+		t.Fatalf("unexpected error committing first upload: %v", err)
+	}
+	if desc.Digest != dgst {
+		t.Fatalf("unexpected digest after commit: %v != %v", desc.Digest, dgst)
+	}
+
+	// Second upload with WithDigestCheck should return ErrBlobAlreadyExists
+	_, err = bs.Create(ctx, WithDigestCheck(dgst))
+	if err == nil {
+		t.Fatal("expected ErrBlobAlreadyExists error, got nil")
+	}
+	eba, ok := err.(distribution.ErrBlobAlreadyExists)
+	if !ok {
+		t.Fatalf("expected ErrBlobAlreadyExists, got %T: %v", err, err)
+	}
+	if eba.Digest != dgst {
+		t.Fatalf("unexpected digest in error: %v != %v", eba.Digest, dgst)
+	}
+	if eba.Descriptor.Digest != dgst {
+		t.Fatalf("unexpected descriptor digest in error: %v != %v", eba.Descriptor.Digest, dgst)
+	}
+}
+
+// TestIdempotentBlobUploadNewBlob verifies that WithDigestCheck allows
+// creating a new upload session when the blob doesn't exist.
+func TestIdempotentBlobUploadNewBlob(t *testing.T) {
+	ctx := context.Background()
+	imageName, _ := reference.WithName("foo/bar")
+	driver := inmemory.New()
+	registry, err := NewRegistry(ctx, driver, BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)), EnableDelete, EnableRedirect)
+	if err != nil {
+		t.Fatalf("error creating registry: %v", err)
+	}
+	repository, err := registry.Repository(ctx, imageName)
+	if err != nil {
+		t.Fatalf("unexpected error getting repo: %v", err)
+	}
+	bs := repository.Blobs(ctx)
+
+	// Create test blob content
+	blobContent := []byte("new blob content that doesn't exist yet")
+	dgst := digest.FromBytes(blobContent)
+
+	// Upload with WithDigestCheck should succeed since blob doesn't exist
+	wr, err := bs.Create(ctx, WithDigestCheck(dgst))
+	if err != nil {
+		t.Fatalf("unexpected error starting upload with digest check: %v", err)
+	}
+	if _, err := wr.Write(blobContent); err != nil {
+		t.Fatalf("unexpected error writing blob: %v", err)
+	}
+	desc, err := wr.Commit(ctx, v1.Descriptor{Digest: dgst})
+	if err != nil {
+		t.Fatalf("unexpected error committing upload: %v", err)
+	}
+	if desc.Digest != dgst {
+		t.Fatalf("unexpected digest after commit: %v != %v", desc.Digest, dgst)
+	}
+
+	// Verify blob exists
+	statDesc, err := bs.Stat(ctx, dgst)
+	if err != nil {
+		t.Fatalf("unexpected error stat-ing blob: %v", err)
+	}
+	if statDesc.Digest != dgst {
+		t.Fatalf("unexpected stat digest: %v != %v", statDesc.Digest, dgst)
+	}
+}
+
+// TestConcurrentBlobUploadsWithDigestCheck simulates concurrent uploads
+// of the same blob and verifies that only one upload session is created
+// when using WithDigestCheck.
+func TestConcurrentBlobUploadsWithDigestCheck(t *testing.T) {
+	ctx := context.Background()
+	imageName, _ := reference.WithName("foo/bar")
+	driver := inmemory.New()
+	registry, err := NewRegistry(ctx, driver, BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)), EnableDelete, EnableRedirect)
+	if err != nil {
+		t.Fatalf("error creating registry: %v", err)
+	}
+	repository, err := registry.Repository(ctx, imageName)
+	if err != nil {
+		t.Fatalf("unexpected error getting repo: %v", err)
+	}
+	bs := repository.Blobs(ctx)
+
+	// Create test blob content
+	blobContent := []byte("blob content for concurrent upload test")
+	dgst := digest.FromBytes(blobContent)
+
+	// First "concurrent" request - creates upload session
+	wr1, err := bs.Create(ctx, WithDigestCheck(dgst))
+	if err != nil {
+		t.Fatalf("unexpected error starting first upload: %v", err)
+	}
+
+	// Complete first upload
+	if _, err := wr1.Write(blobContent); err != nil {
+		t.Fatalf("unexpected error writing to first upload: %v", err)
+	}
+	_, err = wr1.Commit(ctx, v1.Descriptor{Digest: dgst})
+	if err != nil {
+		t.Fatalf("unexpected error committing first upload: %v", err)
+	}
+
+	// Second "concurrent" request with digest check - should get ErrBlobAlreadyExists
+	_, err = bs.Create(ctx, WithDigestCheck(dgst))
+	if err == nil {
+		t.Fatal("expected ErrBlobAlreadyExists error, got nil")
+	}
+	if _, ok := err.(distribution.ErrBlobAlreadyExists); !ok {
+		t.Fatalf("expected ErrBlobAlreadyExists, got %T: %v", err, err)
+	}
+}
+
+// TestBlobUploadRetryWithDigestCheck simulates a client retry scenario
+// where the first upload succeeded but the client didn't receive the
+// response. The retry should detect the blob exists and succeed.
+func TestBlobUploadRetryWithDigestCheck(t *testing.T) {
+	ctx := context.Background()
+	imageName, _ := reference.WithName("foo/bar")
+	driver := inmemory.New()
+	registry, err := NewRegistry(ctx, driver, BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)), EnableDelete, EnableRedirect)
+	if err != nil {
+		t.Fatalf("error creating registry: %v", err)
+	}
+	repository, err := registry.Repository(ctx, imageName)
+	if err != nil {
+		t.Fatalf("unexpected error getting repo: %v", err)
+	}
+	bs := repository.Blobs(ctx)
+
+	// Create test blob content
+	blobContent := []byte("blob content for retry scenario test")
+	dgst := digest.FromBytes(blobContent)
+
+	// Simulate first upload (pretend client didn't get response)
+	wr, err := bs.Create(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error starting upload: %v", err)
+	}
+	if _, err := wr.Write(blobContent); err != nil {
+		t.Fatalf("unexpected error writing blob: %v", err)
+	}
+	_, err = wr.Commit(ctx, v1.Descriptor{Digest: dgst})
+	if err != nil {
+		t.Fatalf("unexpected error committing upload: %v", err)
+	}
+
+	// Simulate client retry with digest check
+	_, err = bs.Create(ctx, WithDigestCheck(dgst))
+	if err == nil {
+		t.Fatal("expected ErrBlobAlreadyExists error for retry, got nil")
+	}
+	eba, ok := err.(distribution.ErrBlobAlreadyExists)
+	if !ok {
+		t.Fatalf("expected ErrBlobAlreadyExists for retry, got %T: %v", err, err)
+	}
+
+	// Verify the descriptor in the error matches what was uploaded
+	if eba.Descriptor.Size != int64(len(blobContent)) {
+		t.Fatalf("unexpected size in error descriptor: %v != %v", eba.Descriptor.Size, len(blobContent))
+	}
+}

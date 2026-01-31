@@ -602,6 +602,52 @@ redirect:
   disable: true
 ```
 
+### `blobupload`
+
+The `blobupload` subsection provides configuration for blob upload concurrency control
+and deduplication. These settings help prevent redundant uploads and optimize storage
+operations under high concurrency.
+
+```yaml
+blobupload:
+  digestlocking:
+    disabled: false
+  sessiondeduplication:
+    disabled: false
+```
+
+#### `digestlocking`
+
+The `digestlocking` option controls digest-scoped locking during blob commits.
+When enabled (the default), the registry acquires a lock for each digest during
+commit operations, preventing race conditions where multiple concurrent commits
+for the same blob could result in redundant storage operations.
+
+| Parameter  | Required | Description                                           |
+|------------|----------|-------------------------------------------------------|
+| `disabled` | no       | Set to `true` to disable digest-scoped locking. This may result in redundant Move operations during concurrent commits of the same blob, but does not affect correctness. Defaults to `false`. |
+
+> **Note**: Digest locking only affects single registry instances. For multi-replica
+> deployments, concurrent commits from different registries may still result in
+> redundant operations. This is safe for content-addressable storage but may
+> increase I/O in high-concurrency scenarios.
+
+#### `sessiondeduplication`
+
+The `sessiondeduplication` option controls upload session deduplication via
+idempotency keys. When enabled (the default), the registry tracks upload sessions
+and allows clients to safely retry upload initiation requests without creating
+duplicate sessions.
+
+| Parameter  | Required | Description                                           |
+|------------|----------|-------------------------------------------------------|
+| `disabled` | no       | Set to `true` to disable session deduplication. Clients will always receive new session IDs even when providing the same idempotency key. Defaults to `false`. |
+
+> **Note**: Session deduplication relies on in-memory state and only works within
+> a single registry instance. For multi-replica deployments behind a load balancer,
+> consider using sticky sessions or accept that retry requests may create new sessions
+> on different replicas.
+
 ## `auth`
 
 ```yaml
@@ -965,6 +1011,29 @@ The prometheus metrics cover `storage`, `notification` and `proxy` statistics.
 
 The url to access the metrics is `HOST:PORT/path`, where `HOST:PORT` is defined
 in `addr` under `debug`.
+
+##### Blob Upload Metrics
+
+The following Prometheus metrics are available for monitoring blob upload operations
+and concurrency control:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `registry_storage_blob_upload_sessions_created_total` | Counter | Total number of blob upload sessions created. |
+| `registry_storage_blob_upload_sessions_deduplicated_digest_total` | Counter | Total number of upload sessions skipped because the blob already exists (digest check). |
+| `registry_storage_blob_upload_sessions_deduplicated_idempotency_key_total` | Counter | Total number of upload sessions resumed via idempotency key. |
+| `registry_storage_blob_commits_total` | Counter | Total number of blob commit operations attempted. |
+| `registry_storage_blob_commits_deduplicated_at_move_total` | Counter | Total number of commits where the blob already existed at the destination (concurrent upload resolution). |
+| `registry_storage_blob_digest_locks_acquired_total` | Counter | Total number of digest locks successfully acquired. |
+| `registry_storage_blob_digest_lock_wait_seconds` | Histogram | Time spent waiting to acquire digest locks. |
+| `registry_storage_blob_commit_duration_seconds` | Histogram | Total time to commit a blob (including lock acquisition, move, link, cleanup). |
+
+These metrics are useful for:
+
+- Capacity planning: Monitor `sessions_created_total` to understand upload volume.
+- Deduplication effectiveness: Compare `deduplicated_*` counters against `sessions_created_total` to measure how often deduplication prevents redundant work.
+- Concurrency analysis: Use `digest_lock_wait_seconds` to identify contention. High wait times may indicate many concurrent uploads of the same blob.
+- Performance monitoring: Track `commit_duration_seconds` to identify slow commits.
 
 ### `headers`
 

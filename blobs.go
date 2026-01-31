@@ -31,6 +31,18 @@ var (
 	ErrBlobInvalidLength = errors.New("blob invalid length")
 )
 
+// ErrBlobAlreadyExists is returned when attempting to create an upload session
+// for a blob that already exists in the repository. This enables idempotent
+// upload behavior by allowing the client to skip redundant uploads.
+type ErrBlobAlreadyExists struct {
+	Digest     digest.Digest
+	Descriptor v1.Descriptor
+}
+
+func (err ErrBlobAlreadyExists) Error() string {
+	return fmt.Sprintf("blob already exists in repository: %v", err.Digest)
+}
+
 // ErrBlobInvalidDigest returned when digest check fails.
 type ErrBlobInvalidDigest struct {
 	Digest digest.Digest
@@ -170,6 +182,32 @@ type CreateOptions struct {
 		// Blob access check will be skipped if set.
 		Stat *v1.Descriptor
 	}
+	// CheckExistence enables idempotent upload behavior. If set to a valid
+	// digest, the storage implementation should check if the blob already
+	// exists in the repository before creating a new upload session. If the
+	// blob exists, ErrBlobAlreadyExists should be returned instead of creating
+	// a duplicate upload session. This prevents resource waste from concurrent
+	// uploads or client retries for the same blob content.
+	CheckExistence struct {
+		// Digest is the expected digest of the blob to be uploaded.
+		// If non-empty, existence check will be performed.
+		Digest digest.Digest
+	}
+	// IdempotencyKey is a client-provided key that can be used to deduplicate
+	// upload session creation. If a session with the same idempotency key
+	// already exists and hasn't expired, the existing session is returned
+	// instead of creating a new one.
+	IdempotencyKey string
+}
+
+// ErrBlobUploadResumed is returned when an upload session is resumed via
+// idempotency key instead of creating a new session.
+type ErrBlobUploadResumed struct {
+	SessionID string
+}
+
+func (err ErrBlobUploadResumed) Error() string {
+	return fmt.Sprintf("blob upload resumed with existing session: %s", err.SessionID)
 }
 
 // BlobWriter provides a handle for inserting data into a blob store.

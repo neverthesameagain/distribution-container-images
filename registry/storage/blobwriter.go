@@ -40,6 +40,10 @@ type blobWriter struct {
 
 	resumableDigestEnabled bool
 	committed              bool
+
+	// Session tracking for deduplication cleanup
+	expectedDigest digest.Digest // digest provided at session creation (may be empty)
+	idempotencyKey string        // idempotency key provided at session creation (may be empty)
 }
 
 var _ distribution.BlobWriter = &blobWriter{}
@@ -55,8 +59,17 @@ func (bw *blobWriter) StartedAt() time.Time {
 
 // Commit marks the upload as completed, returning a valid descriptor. The
 // final size and digest are checked against the first descriptor provided.
+//
+// This method uses digest-scoped locking to prevent race conditions where
+// multiple concurrent commits for the same digest could both proceed with
+// redundant Move operations. The lock ensures that only one commit proceeds
+// while others detect the blob already exists and skip the Move.
 func (bw *blobWriter) Commit(ctx context.Context, desc v1.Descriptor) (v1.Descriptor, error) {
 	dcontext.GetLogger(ctx).Debug("(*blobWriter).Commit")
+
+	// Track commit duration
+	commitDone := MetricsCommitStarted()
+	defer commitDone()
 
 	if err := bw.fileWriter.Commit(ctx); err != nil {
 		return v1.Descriptor{}, err
@@ -70,6 +83,26 @@ func (bw *blobWriter) Commit(ctx context.Context, desc v1.Descriptor) (v1.Descri
 		return v1.Descriptor{}, err
 	}
 
+	// Acquire digest-scoped lock to prevent race conditions during concurrent
+	// commits of the same blob. This ensures that the existence check and move
+	// operation are atomic with respect to other commits of the same digest.
+	var digestLock DigestLock
+	if bw.blobStore.registry != nil && bw.blobStore.registry.digestLocker != nil {
+		lockWaitDone := MetricsDigestLockAcquired()
+		var lockErr error
+		digestLock, lockErr = bw.blobStore.registry.digestLocker.Lock(ctx, canonical.Digest)
+		lockWaitDone() // Record lock wait time
+		if lockErr != nil {
+			// If we can't acquire the lock (e.g., context cancelled), fail the commit
+			dcontext.GetLoggerWithFields(ctx, map[interface{}]interface{}{
+				"digest": canonical.Digest,
+				"error":  lockErr,
+			}).Warn("failed to acquire digest lock for commit")
+			return v1.Descriptor{}, lockErr
+		}
+		defer digestLock.Unlock()
+	}
+
 	if err := bw.moveBlob(ctx, canonical); err != nil {
 		return v1.Descriptor{}, err
 	}
@@ -78,8 +111,25 @@ func (bw *blobWriter) Commit(ctx context.Context, desc v1.Descriptor) (v1.Descri
 		return v1.Descriptor{}, err
 	}
 
+	// Best-effort cleanup of upload resources. If this fails, the upload
+	// directory will be cleaned up by garbage collection. We log but don't
+	// fail the commit since the blob is already successfully stored.
 	if err := bw.removeResources(ctx); err != nil {
-		return v1.Descriptor{}, err
+		dcontext.GetLoggerWithFields(ctx, map[interface{}]interface{}{
+			"upload.id": bw.id,
+			"digest":    canonical.Digest,
+			"error":     err,
+		}).Warn("failed to remove upload resources after successful commit; will be cleaned by GC")
+		// Don't return error - blob is committed, cleanup is best-effort
+	}
+
+	// Remove session from deduplicator after successful commit
+	if bw.blobStore.registry != nil && bw.blobStore.registry.sessionDeduplicator != nil {
+		bw.blobStore.registry.sessionDeduplicator.RemoveSession(
+			bw.id,
+			bw.idempotencyKey,
+			bw.expectedDigest,
+		)
 	}
 
 	err = bw.blobStore.blobAccessController.SetDescriptor(ctx, canonical.Digest, canonical)
@@ -101,6 +151,15 @@ func (bw *blobWriter) Cancel(ctx context.Context) error {
 
 	if err := bw.Close(); err != nil {
 		dcontext.GetLogger(ctx).Errorf("error closing blobwriter: %s", err)
+	}
+
+	// Remove session from deduplicator to allow new sessions for this digest
+	if bw.blobStore.registry != nil && bw.blobStore.registry.sessionDeduplicator != nil {
+		bw.blobStore.registry.sessionDeduplicator.RemoveSession(
+			bw.id,
+			bw.idempotencyKey,
+			bw.expectedDigest,
+		)
 	}
 
 	return bw.removeResources(ctx)
@@ -291,6 +350,17 @@ func (bw *blobWriter) validateBlob(ctx context.Context, desc v1.Descriptor) (v1.
 // moveBlob moves the data into its final, hash-qualified destination,
 // identified by dgst. The layer should be validated before commencing the
 // move.
+//
+// Note on concurrency: There is a small race window where two concurrent
+// commits for the same digest could both pass the existence check before
+// either Move completes. In this case, both Move operations will succeed
+// (the second overwrites the first with identical content). This is safe
+// for content-addressable storage but results in redundant I/O.
+//
+// A potential enhancement would be to add digest-scoped locking here, but
+// this would require distributed locking (e.g., Redis) to work correctly
+// across registry replicas. The current behavior prioritizes simplicity
+// and correctness over optimal I/O efficiency in rare race conditions.
 func (bw *blobWriter) moveBlob(ctx context.Context, desc v1.Descriptor) error {
 	blobPath, err := pathFor(blobDataPathSpec{
 		digest: desc.Digest,
@@ -312,6 +382,7 @@ func (bw *blobWriter) moveBlob(ctx context.Context, desc v1.Descriptor) error {
 		// been uploaded, since the blob storage is content-addressable.
 		// While it may be corrupted, detection of such corruption belongs
 		// elsewhere.
+		MetricsCommitDeduplicatedAtMove()
 		return nil
 	}
 

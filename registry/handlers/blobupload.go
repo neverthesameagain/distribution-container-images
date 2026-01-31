@@ -64,6 +64,14 @@ type blobUploadHandler struct {
 
 // StartBlobUpload begins the blob upload process and allocates a server-side
 // blob writer session, optionally mounting the blob from a separate repository.
+//
+// When a digest is provided via the "digest" query parameter (for monolithic
+// uploads), the handler first checks if the blob already exists in the
+// repository. If it does, it returns 201 Created immediately without creating
+// a new upload session. This provides idempotent behavior for:
+//   - Client retries where the upload may have already succeeded
+//   - Concurrent uploads of the same blob from multiple clients
+//   - Monolithic uploads where the digest is known upfront
 func (buh *blobUploadHandler) StartBlobUpload(w http.ResponseWriter, r *http.Request) {
 	var options []distribution.BlobCreateOption
 
@@ -77,6 +85,26 @@ func (buh *blobUploadHandler) StartBlobUpload(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// For monolithic uploads, the digest is provided upfront. Check if the
+	// blob already exists to enable idempotent upload behavior and prevent
+	// duplicate upload sessions under concurrent requests or retries.
+	if dgstStr := r.FormValue("digest"); dgstStr != "" {
+		dgst, err := digest.Parse(dgstStr)
+		if err != nil {
+			buh.Errors = append(buh.Errors, errcode.ErrorCodeDigestInvalid.WithDetail(err))
+			return
+		}
+		options = append(options, storage.WithDigestCheck(dgst))
+	}
+
+	// Support client-provided idempotency key for retry safety.
+	// If the same idempotency key is provided within the TTL window,
+	// the existing upload session is returned instead of creating a new one.
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+	if idempotencyKey != "" {
+		options = append(options, storage.WithIdempotencyKey(idempotencyKey))
+	}
+
 	blobs := buh.Repository.Blobs(buh)
 	upload, err := blobs.Create(buh, options...)
 	if err != nil {
@@ -84,6 +112,34 @@ func (buh *blobUploadHandler) StartBlobUpload(w http.ResponseWriter, r *http.Req
 			if err := buh.writeBlobCreatedHeaders(w, ebm.Descriptor); err != nil {
 				buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 			}
+		} else if eba, ok := err.(distribution.ErrBlobAlreadyExists); ok {
+			// Blob already exists - return 201 Created for idempotent behavior.
+			// This prevents duplicate upload sessions when clients retry or when
+			// multiple clients upload the same blob concurrently.
+			dcontext.GetLoggerWithField(buh, "digest", eba.Digest).
+				Info("blob already exists, returning success for idempotent upload")
+			if err := buh.writeBlobCreatedHeaders(w, eba.Descriptor); err != nil {
+				buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+			}
+		} else if ebr, ok := err.(distribution.ErrBlobUploadResumed); ok {
+			// Session already exists for this idempotency key - resume it
+			dcontext.GetLoggerWithField(buh, "session_id", ebr.SessionID).
+				Info("resuming existing upload session via idempotency key")
+			resumedUpload, resumeErr := blobs.Resume(buh, ebr.SessionID)
+			if resumeErr != nil {
+				// Session may have expired or been cleaned up; treat as new session needed
+				buh.Errors = append(buh.Errors, errcode.ErrorCodeBlobUploadUnknown.WithDetail(resumeErr))
+				return
+			}
+			buh.Upload = resumedUpload
+			buh.UUID = ebr.SessionID
+			if err := buh.blobUploadResponse(w, r); err != nil {
+				buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+				return
+			}
+			w.Header().Set("Docker-Upload-UUID", buh.Upload.ID())
+			w.WriteHeader(http.StatusAccepted)
+			return
 		} else if err == distribution.ErrUnsupported {
 			buh.Errors = append(buh.Errors, errcode.ErrorCodeUnsupported)
 		} else {
